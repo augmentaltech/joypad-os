@@ -520,9 +520,15 @@ bool usbd_reset_to_hid(void)
 // ============================================================================
 
 // Called by router immediately when input arrives (push-based notification)
+volatile uint32_t oi_count, oi_player, oi_buttons;
+
 static void usbd_on_input(output_target_t output, uint8_t player_index, const input_event_t* event)
 {
     (void)output;  // Always USB_DEVICE
+
+    oi_count++;
+    oi_player = player_index;
+    if (event) oi_buttons = event->buttons;
 
     if (player_index >= USB_MAX_PLAYERS || !event) {
         return;
@@ -606,6 +612,11 @@ void usbd_init(void)
 #ifdef CONFIG_NGC
     // GameCube config mode: always force CDC-only (ignore flash-saved mode)
     output_mode = USB_OUTPUT_MODE_CDC;
+#endif
+#ifdef MSGOUT_DK_BUILD
+    // DK message-output -> Switch bring-up: always enumerate as a Switch Pro
+    // controller (ignore flash) so a Nintendo Switch recognizes the board.
+    output_mode = USB_OUTPUT_MODE_SWITCH;
 #endif
     printf("[usbd] Mode: %s\n", mode_names[output_mode]);
 
@@ -755,6 +766,8 @@ void usbd_init(void)
     printf("[usbd] Initialization complete\n");
 }
 
+volatile uint32_t sw_task_count, sw_ready_count, sw_sent_count;
+
 void usbd_task(void)
 {
     // TinyUSB device task - runs from core0 main loop
@@ -797,8 +810,10 @@ void usbd_task(void)
             // Switch mode: process CDC tasks, delegate to mode interface
             cdc_task();
             const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SWITCH];
+            sw_task_count++;
             if (mode && mode->is_ready && mode->is_ready()) {
-                usbd_send_report(0);
+                sw_ready_count++;
+                if (usbd_send_report(0)) sw_sent_count++;
             }
             break;
         }
@@ -1055,13 +1070,38 @@ static bool usbd_send_switch_report(uint8_t player_index)
         return false;
     }
 
-    // Check for pending event (event-driven from tap callback)
-    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+    if (player_index >= USB_MAX_PLAYERS) {
         return false;
     }
 
+#ifdef MSGOUT_DK_BUILD
+    // DK message-output -> Switch: a Switch only registers a controller that
+    // streams reports continuously, not just on input. Hold the last state
+    // (centered-stick neutral until the first message-output write) and send it
+    // every poll, folding in pending events as they arrive.
+    static input_event_t dk_state[USB_MAX_PLAYERS];
+    static bool dk_inited = false;
+    if (!dk_inited) {
+        memset(dk_state, 0, sizeof(dk_state));
+        for (uint8_t p = 0; p < USB_MAX_PLAYERS; p++) {
+            dk_state[p].analog[0] = 128; dk_state[p].analog[1] = 128;
+            dk_state[p].analog[2] = 128; dk_state[p].analog[3] = 128;
+        }
+        dk_inited = true;
+    }
+    if (pending_flags[player_index]) {
+        dk_state[player_index] = pending_events[player_index];
+        pending_flags[player_index] = false;
+    }
+    const input_event_t* event = &dk_state[player_index];
+#else
+    // Check for pending event (event-driven from tap callback)
+    if (!pending_flags[player_index]) {
+        return false;
+    }
     const input_event_t* event = &pending_events[player_index];
     pending_flags[player_index] = false;  // Clear after consumption
+#endif
 
     // Apply profile (combos, button remaps)
     profile_output_t profile_out;

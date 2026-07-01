@@ -387,6 +387,7 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
 
         # --- BLE output (peripheral mode) ---
         "${SHARED_SRC}/bt/ble_output/ble_output.c"
+        "${SHARED_SRC}/bt/ble_output/msgout_uart.c"   # parallel wired-UART msgout input
         "${SHARED_SRC}/bt/ble_output/ble_output_keyboard.c"
         "${SHARED_SRC}/bt/ble_output/ble_output_mouse.c"
         "${SHARED_SRC}/bt/ble_output/ble_output_xbox.c"
@@ -661,7 +662,7 @@ if(APP_TYPE STREQUAL "controller_btusb")
 
     add_custom_command(
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ble_gamepad.h"
-        COMMAND python3 ${COMPILE_GATT}
+        COMMAND ${PYTHON_EXECUTABLE} ${COMPILE_GATT}
             "${SHARED_SRC}/bt/ble_output/ble_gamepad.gatt"
             "${CMAKE_CURRENT_BINARY_DIR}/ble_gamepad.h"
         DEPENDS "${SHARED_SRC}/bt/ble_output/ble_gamepad.gatt"
@@ -670,7 +671,7 @@ if(APP_TYPE STREQUAL "controller_btusb")
 
     add_custom_command(
         OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ble_xbox.h"
-        COMMAND python3 ${COMPILE_GATT}
+        COMMAND ${PYTHON_EXECUTABLE} ${COMPILE_GATT}
             "${SHARED_SRC}/bt/ble_output/ble_xbox.gatt"
             "${CMAKE_CURRENT_BINARY_DIR}/ble_xbox.h"
         DEPENDS "${SHARED_SRC}/bt/ble_output/ble_xbox.gatt"
@@ -733,6 +734,29 @@ elseif(BOARD MATCHES "nrf52840dongle")
     # board + boards/aprbrother_nrf52840.overlay (see nrf/Makefile alias).
     set(BOARD_DEFINE "BOARD_APRBROTHER_NRF52840=1")
     set(BOARD_NAME_STR "aprbrother_nrf52840")
+elseif(BOARD MATCHES "nrf52840dk")
+    # Nordic nRF52840 DK (PCA10056) — bring-up board for the MouthPad -> Switch
+    # path. No BOARD_DEFINE: it uses the default (XIAO-style) i2c1 display path,
+    # which boards/nrf52840dk_nrf52840.overlay enables. Unlike the shipping
+    # boards, this build doesn't get the nRF MDK on the app include path, so
+    # TinyUSB's dcd_nrf5x.c can't find nrf.h — add the MDK headers here.
+    set(BOARD_NAME_STR "nrf52840dk")
+    target_include_directories(app PRIVATE "${ZEPHYR_BASE}/../modules/hal/nordic/nrfx/bsp/stable/mdk")
+    # Compatibility shim: TinyUSB's dcd_nrf5x.c (built for an older nrfx) calls
+    # nrf_clock_hf_is_running(), which NCS v3.3.0's nrfx removed.
+    target_sources(app PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/nrfx_compat_shim.c")
+    # DK bring-up marker — gates the DK-only message-output -> Switch tweaks
+    # (force USB Switch output mode in usbd_init; trimmed adv data in ble_output).
+    target_compile_definitions(app PRIVATE MSGOUT_DK_BUILD=1)
+    if(APP_TYPE STREQUAL "controller_btusb")
+        # The MouthPad message-output -> Switch path is peripheral-only: the board
+        # advertises 6E40FE00 and outputs USB. controller_btusb otherwise sets
+        # REQUIRE_BT_INPUT=1, which makes the BTstack post-init the BLE *central*
+        # setup (bt_central_post_init) instead of ble_output_late_init — so the
+        # peripheral never advertises. Force it off here (last -D wins) so the
+        # post-init is ble_output_late_init and the board advertises.
+        target_compile_definitions(app PRIVATE REQUIRE_BT_INPUT=0)
+    endif()
 else()
     set(BOARD_NAME_STR "xiao_ble")
 endif()

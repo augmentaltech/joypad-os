@@ -44,5 +44,12 @@ CHARACTERISTIC, ORG_BLUETOOTH_CHARACTERISTIC_HID_CONTROL_POINT, DYNAMIC | WRITE_
 // Nordic UART Service (NUS) — wireless configuration over BLE
 #import <nordic_spp_service.gatt>
 
+// MouthPad message-output service — the companion app (BLE central) connects and
+// writes ASCII button-name tokens ("A", "ZL", "DUP", "PLUS", with optional "+"/"-"
+// hold/release suffix). The write handler in ble_output.c injects them as gamepad
+// buttons into the router -> Switch USB output.
+PRIMARY_SERVICE, 6E40FE00-B5A3-F393-E0A9-E50E24DCCA9E
+CHARACTERISTIC, 6E40FE01-B5A3-F393-E0A9-E50E24DCCA9E, DYNAMIC | WRITE | WRITE_WITHOUT_RESPONSE,
+
 PRIMARY_SERVICE, GATT_SERVICE
 CHARACTERISTIC, GATT_DATABASE_HASH, READ,

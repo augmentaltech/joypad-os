@@ -25,6 +25,16 @@
 #define REQUIRE_BT_INPUT 0          // BLE Central: scan for BT/BLE controllers
 #endif
 
+// The DK bring-up build (MSGOUT_DK_BUILD) drives the Switch as a message-output
+// *peripheral* — BLE advertising 6E40FE00 + wired UART — and is never a BLE
+// central. controller_btusb's CMake sets REQUIRE_BT_INPUT=1, and the DK's
+// -DREQUIRE_BT_INPUT=0 override loses the "last -D wins" race, so pin the
+// scanner off here where app.c is guaranteed to see it.
+#if defined(MSGOUT_DK_BUILD)
+#undef REQUIRE_BT_INPUT
+#define REQUIRE_BT_INPUT 0
+#endif
+
 // Output drivers
 #ifndef REQUIRE_BLE_OUTPUT
 #define REQUIRE_BLE_OUTPUT 1

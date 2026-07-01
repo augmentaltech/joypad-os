@@ -1,0 +1,79 @@
+/* Joypad — Nordic nRF52840 DK (PCA10056) devicetree overlay
+ *
+ * Bring-up target for the MouthPad message-output -> Switch path. The DK is a
+ * bare board (no XIAO expansion-board OLED, no NeoPixel), flashed over its
+ * onboard J-Link (raw zephyr.hex, no UF2/MCUboot), with SEGGER RTT for logs.
+ *
+ * TinyUSB drives the USB peripheral directly, so disable Zephyr's USBD node.
+ *
+ * The shared display transport (display_i2c_nrf.c) unconditionally does
+ * DEVICE_DT_GET(DT_NODELABEL(i2c1)); the DK leaves i2c1 disabled, which breaks
+ * the build. Enable i2c1 on a free pin pair so the GET resolves — nothing is
+ * wired there, so the runtime probe simply reports "no I2C device" and the
+ * display stays inert.
+ */
+
+&usbd {
+	status = "disabled";
+};
+
+&pinctrl {
+	i2c1_default: i2c1_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 30)>,
+				<NRF_PSEL(TWIM_SCL, 0, 31)>;
+		};
+	};
+
+	i2c1_sleep: i2c1_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 30)>,
+				<NRF_PSEL(TWIM_SCL, 0, 31)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c1 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-1 = <&i2c1_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/* Wired-UART message-output input — a parallel path to the BLE 6E40FE01 service.
+ * A USB-to-UART adapter writes the same ASCII button tokens. uart1 on free DK
+ * header pins (P1.01 TX, P1.02 RX): adapter TX -> board RX (P1.02), adapter RX
+ * <- board TX (P1.01), GND common. The `chosen` node activates msgout_uart.c. */
+/ {
+	chosen {
+		joypad,msgout-uart = &uart1;
+	};
+};
+
+&pinctrl {
+	uart1_default: uart1_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 1)>,
+				<NRF_PSEL(UART_RX, 1, 2)>;
+		};
+	};
+
+	uart1_sleep: uart1_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 1)>,
+				<NRF_PSEL(UART_RX, 1, 2)>;
+			low-power-enable;
+		};
+	};
+};
+
+&uart1 {
+	compatible = "nordic,nrf-uarte";
+	status = "okay";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-1 = <&uart1_sleep>;
+	pinctrl-names = "default", "sleep";
+};

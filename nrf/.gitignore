@@ -10,3 +10,4 @@ zephyr/
 
 # Build output
 build/
+build_*/

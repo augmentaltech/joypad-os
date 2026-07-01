@@ -14,6 +14,7 @@
 #include "ble_output_xbox.h"
 #include "ble_nus.h"
 #include "ble_gamepad.h"  // Generated from ble_gamepad.gatt by compile_gatt.py
+#include "msgout.h"       // shared msgout_handle_token() + parallel wired-UART path
 
 // Xbox GATT database (compiled from ble_xbox.gatt, wrapped in ble_xbox_gatt_db.c)
 extern const uint8_t *ble_xbox_profile_data;
@@ -25,6 +26,8 @@ extern const uint8_t *ble_xbox_profile_data;
 #include "core/services/storage/flash.h"
 #include "usb/usbd/cdc/cdc_commands.h"
 #include "platform/platform.h"
+#include <zephyr/kernel.h>
+#include <string.h>
 
 // Forward declare to avoid pulling in manager.h (TinyUSB type conflicts)
 extern void feedback_set_rumble(uint8_t player_index, uint8_t left, uint8_t right);
@@ -310,6 +313,31 @@ static const uint8_t adv_data_standard[] = {
     0x03, BLUETOOTH_DATA_TYPE_APPEARANCE, 0xC4, 0x03,
 };
 
+// Scan response (standard mode): advertise the MouthPad message-output service
+// UUID (6E40FE00) so the companion's scanner — which only connects to devices
+// whose advertised service list contains it — can find this board. The adv
+// packet is already near the 31-byte limit and a 128-bit UUID needs 18 bytes,
+// so it goes in the scan response. btleplug active-scans, so it receives this.
+static const uint8_t scan_resp_standard[] = {
+    0x11, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS,
+    // 6E40FE00-B5A3-F393-E0A9-E50E24DCCA9E, little-endian (LSB first)
+    0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
+    0x93, 0xF3, 0xA3, 0xB5, 0x00, 0xFE, 0x40, 0x6E,
+};
+
+#ifdef MSGOUT_DK_BUILD
+// Minimal adv data for the nRF52840 DK: flags + complete local name only (24
+// bytes). adv_data_standard is 32 bytes — over the 31-byte legacy advertising
+// limit — which the strict nRF SoftDevice Controller rejects, so the board
+// never goes on air. The 6E40FE00 service UUID rides in the scan response.
+static const uint8_t adv_data_dk[] = {
+    0x02, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
+    0x14, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'J', 'o', 'y', 'p', 'a', 'd', 'O', 'S', ' ',
+    'C', 'o', 'n', 't', 'r', 'o', 'l', 'l', 'e', 'r',
+};
+#endif
+
 static const uint8_t adv_data_xbox[] = {
     // Flags: general discoverable, BR/EDR not supported
     0x02, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
@@ -507,17 +535,218 @@ void ble_output_init(void)
     last_sent_xbox = pending_xbox;
 }
 
-// ATT write callback — debug logging for all GATT writes
+// ---------------------------------------------------------------------------
+// MouthPad message-output service (6E40FE00 / write char 6E40FE01)
+//
+// The companion app (BLE central) writes ASCII button-name tokens; we map each
+// to a JP_BUTTON_* and inject it as a gamepad event into the router, which the
+// active output (Switch USB HID on the DK bring-up) turns into a controller
+// report. A bare token is a tap (press now, auto-release shortly after); a
+// trailing '+' holds and '-' releases, so chords can be built up over several
+// writes. Sticks are centered so only buttons move.
+// ---------------------------------------------------------------------------
+static uint32_t msgout_held_buttons = 0;
+// Held analog stick axes (0..255, 128 = center): LX, LY, RX, RY. Set by
+// AXIS=VALUE tokens; persist across submits like the held button chord.
+static uint8_t msgout_axes[4] = { 128, 128, 128, 128 };
+
+static int msgout_axis_index(const char *t)
+{
+    if (!strcmp(t, "LX")) return 0;
+    if (!strcmp(t, "LY")) return 1;
+    if (!strcmp(t, "RX")) return 2;
+    if (!strcmp(t, "RY")) return 3;
+    return -1;
+}
+
+// The MouthPad streams raw tongue-touch coordinates, not stick values: X spans
+// 0..1024, Y spans 0..768, with a centered dead zone (+/-128 raw units, matching
+// the MouthPad's no_activation_middle_box == +/-1 cell) that means "no input".
+// Map to the 0..255 stick range, 128 = center: anything inside the dead zone is
+// neutral, and each side scales linearly out to the extreme. LX/RX are X axes
+// (even index), LY/RY are Y axes (odd index). Raw X grows toward the user's left,
+// so the X axes are mirrored here to match intuitive steering; drop the
+// `raw = range - raw` line (or extend it to a Y axis) if a polarity is wrong on
+// your hardware.
+#define MSGOUT_TOUCH_DEADZONE 128u
+
+static uint8_t msgout_touch_axis_to_stick(int axis, unsigned raw)
+{
+    unsigned range  = (axis & 1) ? 768u : 1024u;   // Y : X
+    unsigned center = range / 2u;
+    unsigned dz     = MSGOUT_TOUCH_DEADZONE;
+    if (raw > range) raw = range;
+    if ((axis & 1) == 0) raw = range - raw;        // X grows toward the user's left; mirror it
+    if (raw >= center - dz && raw <= center + dz) return 128u;
+    if (raw < center) return (uint8_t)(raw * 128u / (center - dz));
+    return (uint8_t)(128u + (raw - (center + dz)) * 127u / (range - (center + dz)));
+}
+
+static uint32_t msgout_token_to_button(const char *t)
+{
+    if (!strcmp(t, "A"))       return JP_BUTTON_B2;  // Switch A
+    if (!strcmp(t, "B"))       return JP_BUTTON_B1;  // Switch B
+    if (!strcmp(t, "X"))       return JP_BUTTON_B3;  // Switch X
+    if (!strcmp(t, "Y"))       return JP_BUTTON_B4;  // Switch Y
+    if (!strcmp(t, "L"))       return JP_BUTTON_L1;
+    if (!strcmp(t, "R"))       return JP_BUTTON_R1;
+    if (!strcmp(t, "ZL"))      return JP_BUTTON_L2;
+    if (!strcmp(t, "ZR"))      return JP_BUTTON_R2;
+    if (!strcmp(t, "MINUS"))   return JP_BUTTON_S1;
+    if (!strcmp(t, "PLUS"))    return JP_BUTTON_S2;
+    if (!strcmp(t, "L3"))      return JP_BUTTON_L3;
+    if (!strcmp(t, "R3"))      return JP_BUTTON_R3;
+    if (!strcmp(t, "HOME"))    return JP_BUTTON_A1;
+    if (!strcmp(t, "CAPTURE")) return JP_BUTTON_A2;
+    if (!strcmp(t, "DUP"))     return JP_BUTTON_DU;
+    if (!strcmp(t, "DDOWN"))   return JP_BUTTON_DD;
+    if (!strcmp(t, "DLEFT"))   return JP_BUTTON_DL;
+    if (!strcmp(t, "DRIGHT"))  return JP_BUTTON_DR;
+    return 0;
+}
+
+static void msgout_submit(uint32_t buttons)
+{
+    input_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.transport = INPUT_TRANSPORT_BT_BLE;
+    ev.buttons = buttons;
+    ev.analog[0] = msgout_axes[0];  // LX
+    ev.analog[1] = msgout_axes[1];  // LY
+    ev.analog[2] = msgout_axes[2];  // RX
+    ev.analog[3] = msgout_axes[3];  // RY
+    router_submit_input(&ev);
+}
+
+static void msgout_release_handler(struct k_work *work)
+{
+    (void)work;
+    msgout_submit(msgout_held_buttons);  // drop the tapped button, keep held chord
+}
+static K_WORK_DELAYABLE_DEFINE(msgout_release_work, msgout_release_handler);
+
+// Non-static: shared with the wired-UART path (msgout_uart.c) via msgout.h.
+void msgout_handle_token(const uint8_t *data, uint16_t len)
+{
+    char tok[24];
+    size_t n = 0;
+    for (uint16_t i = 0; i < len && n < sizeof(tok) - 1; i++) {
+        char c = (char)data[i];
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\0') continue;  // trim
+        tok[n++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;          // upper
+    }
+    tok[n] = 0;
+    if (n == 0) return;
+
+    // Analog stick: "LX=200" / "LY=0" / "RX=128" / "RY=255" (0..255, 128=center).
+    char *eq = strchr(tok, '=');
+    if (eq) {
+        *eq = '\0';
+        int axis = msgout_axis_index(tok);
+        if (axis >= 0) {
+            unsigned v = 0;
+            for (const char *p = eq + 1; *p >= '0' && *p <= '9'; p++)
+                v = v * 10u + (unsigned)(*p - '0');
+            msgout_axes[axis] = msgout_touch_axis_to_stick(axis, v);
+            msgout_submit(msgout_held_buttons);
+            printf("[msgout] axis %s raw=%u -> %u\n", tok, v, msgout_axes[axis]);
+        }
+        return;
+    }
+
+    // Recenter all sticks.
+    if (!strcmp(tok, "CENTER")) {
+        msgout_axes[0] = msgout_axes[1] = msgout_axes[2] = msgout_axes[3] = 128;
+        msgout_submit(msgout_held_buttons);
+        return;
+    }
+
+    char suffix = 0;
+    if (tok[n - 1] == '+' || tok[n - 1] == '-') { suffix = tok[n - 1]; tok[--n] = 0; }
+
+    uint32_t btn = msgout_token_to_button(tok);
+    printf("[msgout] token='%s' suffix=%c -> buttons=0x%05x\n",
+           tok, suffix ? suffix : '.', (unsigned)btn);
+    if (!btn) return;
+
+    if (suffix == '+') {
+        msgout_held_buttons |= btn;
+        msgout_submit(msgout_held_buttons);
+    } else if (suffix == '-') {
+        msgout_held_buttons &= ~btn;
+        msgout_submit(msgout_held_buttons);
+    } else {
+        msgout_submit(msgout_held_buttons | btn);
+        k_work_reschedule(&msgout_release_work, K_MSEC(90));
+    }
+}
+
+// BTstack service handler for the message-output service (6E40FE00). A DYNAMIC
+// custom characteristic needs a *registered service handler* to receive its
+// write payload — the generic att_write_callback only sees the transaction
+// execute phase (handle 0, no data). This is the same mechanism the NUS char
+// (nordic_spp) uses in this GATT db.
+volatile uint32_t msgout_svc_count;
+volatile uint32_t msgout_svc_handle;
+volatile uint32_t msgout_svc_size;
+volatile uint32_t msgout_svc_txmode;
+volatile uint32_t msgout_svc_b0;
+
+static int msgout_service_write_callback(hci_con_handle_t con_handle, uint16_t attribute_handle,
+                                         uint16_t transaction_mode, uint16_t offset,
+                                         uint8_t *buffer, uint16_t buffer_size)
+{
+    (void)con_handle;
+    (void)offset;
+    msgout_svc_count++;
+    msgout_svc_handle = attribute_handle;
+    msgout_svc_size = buffer_size;
+    msgout_svc_txmode = transaction_mode;
+    msgout_svc_b0 = buffer_size ? buffer[0] : 0;
+    if (transaction_mode != ATT_TRANSACTION_MODE_NONE) {
+        return 0;
+    }
+    if (attribute_handle == ATT_CHARACTERISTIC_6E40FE01_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE) {
+        msgout_handle_token(buffer, buffer_size);
+    }
+    return 0;
+}
+static att_service_handler_t msgout_service_handler;
+
+// Bring-up instrumentation: record every ATT write this callback sees, so it can
+// be read back over J-Link (printk-to-RTT isn't functioning on this build).
+volatile uint32_t msgout_dbg_count;
+volatile uint32_t msgout_dbg_handle;
+volatile uint32_t msgout_dbg_size;
+volatile uint32_t msgout_dbg_b0;
+volatile uint32_t msgout_dbg_txmode;
+volatile uint32_t msgout_dbg_mychar_hits;
+volatile uint32_t msgout_dbg_handles_or;
+
+// ATT write callback — debug logging + MouthPad message-output dispatch
 static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle,
                                uint16_t transaction_mode, uint16_t offset,
                                uint8_t *buffer, uint16_t buffer_size)
 {
+    msgout_dbg_count++;
+    msgout_dbg_handle = att_handle;
+    msgout_dbg_size = buffer_size;
+    msgout_dbg_b0 = buffer_size ? buffer[0] : 0;
+    msgout_dbg_txmode = transaction_mode;
+    msgout_dbg_handles_or |= att_handle;
+    if (att_handle == ATT_CHARACTERISTIC_6E40FE01_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE) {
+        msgout_dbg_mychar_hits++;
+    }
     printf("[ble_output] ATT_WRITE: handle=0x%04x size=%d", att_handle, buffer_size);
     if (buffer_size > 0 && buffer_size <= 8) {
         printf(" data=");
         for (int i = 0; i < buffer_size; i++) printf("%02x", buffer[i]);
     }
     printf("\n");
+
+    if (att_handle == ATT_CHARACTERISTIC_6E40FE01_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE) {
+        msgout_handle_token(buffer, buffer_size);
+    }
     return 0;  // Let hids_device handle it
 }
 
@@ -528,6 +757,7 @@ bool btstack_host_external_att_server(void) { return true; }
 // Called after bt_init() — BTstack must be running before GATT/GAP setup
 void ble_output_late_init(void)
 {
+    printk("[BLE] late_init enter\n");
     printf("[ble_output] Setting up BLE GATT services (mode: %s)\n",
            ble_output_get_mode_name(current_mode));
 
@@ -541,6 +771,18 @@ void ble_output_late_init(void)
     printf("[ble_output] Using %s GATT database (ptr=%p)\n",
            (current_mode == BLE_MODE_XBOX) ? "Xbox" : "Standard", gatt_db);
     att_server_init(gatt_db, NULL, att_write_callback);
+
+    // Register a dedicated service handler for the message-output service so its
+    // write payload is delivered here (see msgout_service_write_callback).
+    msgout_service_handler.start_handle  = ATT_SERVICE_6E40FE00_B5A3_F393_E0A9_E50E24DCCA9E_START_HANDLE;
+    msgout_service_handler.end_handle    = ATT_SERVICE_6E40FE00_B5A3_F393_E0A9_E50E24DCCA9E_END_HANDLE;
+    msgout_service_handler.read_callback  = NULL;
+    msgout_service_handler.write_callback = &msgout_service_write_callback;
+    att_server_register_service_handler(&msgout_service_handler);
+
+    // Parallel wired-UART message-output path: a USB-to-UART adapter can write the
+    // same tokens. No-op unless a board selects a msgout UART in the devicetree.
+    msgout_uart_init();
 
     // Setup GATT services
     battery_service_server_init(100);
@@ -607,8 +849,13 @@ void ble_output_late_init(void)
         adv_data_len = sizeof(adv_data_xbox);
     } else {
         gap_name = "JoypadOS Controller";
+#ifdef MSGOUT_DK_BUILD
+        adv_data = adv_data_dk;
+        adv_data_len = sizeof(adv_data_dk);
+#else
         adv_data = adv_data_standard;
         adv_data_len = sizeof(adv_data_standard);
+#endif
     }
     gap_set_local_name(gap_name);
 
@@ -618,7 +865,13 @@ void ble_output_late_init(void)
     memset(null_addr, 0, 6);
     gap_advertisements_set_params(adv_int_min, adv_int_max, 0, 0, null_addr, 0x07, 0x00);
     gap_advertisements_set_data(adv_data_len, (uint8_t *)adv_data);
+    if (current_mode != BLE_MODE_XBOX) {
+        // Standard GATT db carries the 6E40FE00 message-output service; advertise
+        // its UUID via the scan response so the companion will connect.
+        gap_scan_response_set_data(sizeof(scan_resp_standard), (uint8_t *)scan_resp_standard);
+    }
     gap_advertisements_enable(1);
+    printk("[BLE] advertising ENABLED (mode=%d name=%s)\n", current_mode, gap_name);
 
     // Register event handlers
     hci_event_callback_registration.callback = &packet_handler;

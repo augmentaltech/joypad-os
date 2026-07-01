@@ -431,3 +431,143 @@ GitHub Actions (`.github/workflows/build.yml`):
 - Builds all apps on push to `main`
 - Docker-based for consistency
 - Artifacts in `releases/` directory
+
+---
+
+# MouthPad message-output → Nintendo Switch (nRF52840 DK bring-up)
+
+> SFP-746 "BLE routing": drive a Nintendo Switch from the MouthPad companion app
+> through a joypad-os board. **Status: BLE write → button injection VERIFIED on
+> hardware.** Remaining: strip debug instrumentation, confirm the companion
+> (btleplug) write end-to-end, verify the USB HID report.
+
+## Goal / data flow
+MouthPad gesture → companion `.aaMouthpadMessageOutput("A")` → BLE central writes
+the ASCII token to the board's message-output service → firmware maps token →
+`JP_BUTTON_*` → `router_submit_input` → `switch_mode` USB HID (Switch Pro).
+```
+companion (central) --write "A"--> 6E40FE01 --> ble_output service handler
+  --> msgout_handle_token() --> JP_BUTTON_B2 --> router_submit_input
+  --> switch_mode USB HID --> Switch
+```
+
+## Hardware / identifiers
+- **DK board**: nRF52840 DK, J-Link serial **1050287076** (build/flash/RTT target).
+- **MouthPad**: J-Link serial **1050222688** — DO NOT flash.
+- **Board BLE address**: `DE:B7:53:18:22:29` (static-random; FICR DEVICEADDR0=
+  0x53182229, DEVICEADDR1=0xD84A1EB7, byte5 0x1E|0xC0=0xDE). Hosts may show a
+  cached name **"MouthPad^USB"** (this dev chip previously ran MouthPad fw — name
+  stale, address correct).
+- NCS **v3.3.0** at `C:\ncs`; west via `nrfutil toolchain-manager launch
+  --ncs-version v3.3.0 -- west ...`.
+
+## Build & flash (APP_TYPE=controller_btusb — the nRF BLE-peripheral app)
+```bash
+cd /c/ncs
+# pristine (needed when EXTRA_CONF_FILE changes; use conf names RELATIVE to the
+# app dir — west does not MSYS-translate the semicolon list):
+nrfutil toolchain-manager launch --ncs-version v3.3.0 -- \
+  west build -b nrf52840dk/nrf52840 /c/Users/suraj/code/joypad-os/nrf \
+    -d /c/Users/suraj/code/joypad-os/nrf/build_dk_ctrl --pristine --no-sysbuild -- \
+    -DDTC_OVERLAY_FILE=/c/Users/suraj/code/joypad-os/nrf/boards/nrf52840dk_nrf52840.overlay \
+    -DEXTRA_CONF_FILE='prj_controller_btusb.conf;dk_rtt.conf'
+# incremental (no conf change):  west build -d .../nrf/build_dk_ctrl
+nrfutil toolchain-manager launch --ncs-version v3.3.0 -- \
+  west flash -d /c/Users/suraj/code/joypad-os/nrf/build_dk_ctrl --dev-id 1050287076
+```
+
+## Files changed
+- `nrf/boards/nrf52840dk_nrf52840.{overlay,conf}` — DK port: enable `i2c1`
+  (display init resolves), disable `usbd` (TinyUSB owns USB).
+- `nrf/dk_rtt.conf` — RTT console overlay (note: printk-to-RTT is NOT actually
+  working on this build — see gotchas).
+- `nrf/CMakeLists.txt` — `nrf52840dk` board case: `python3`→`${PYTHON_EXECUTABLE}`
+  for the GATT generator; MDK include (`nrfx/bsp/stable/mdk`) for TinyUSB `nrf.h`;
+  `nrfx_compat_shim.c`; **`REQUIRE_BT_INPUT=0`** (so BTstack post-init is
+  `ble_output_late_init`/advertise, not `bt_central_post_init`); `MSGOUT_DK_BUILD=1`.
+- `nrf/src/nrfx_compat_shim.c` — `nrf_clock_hf_is_running` (removed in v3.3.0 nrfx).
+- `src/bt/ble_output/ble_gamepad.gatt` — adds `6E40FE00` service + writable
+  `6E40FE01` char (value handle **0x4b**, service range 0x49–0x4b).
+- `src/bt/ble_output/ble_output.c`:
+  - `scan_resp_standard` — advertises `6E40FE00` in the SCAN RESPONSE (the
+    companion connects only to advertisers of this UUID; adv packet is full).
+  - `adv_data_dk` (MSGOUT_DK_BUILD) — 24-byte adv data (stock 32B is >31B limit).
+  - **KEY FIX: `msgout_service_write_callback` + `att_server_register_service_handler`**
+    for the 6E40FE00 range. BTstack delivers a custom DYNAMIC char's write PAYLOAD
+    only to a registered service handler — the generic `att_write_callback` only
+    sees handle-0 / transaction-EXECUTE housekeeping, NOT the data. Same mechanism
+    the NUS char uses (`nordic_spp_service_server_init`).
+  - `msgout_handle_token` — parser: `A B X Y L R ZL ZR PLUS MINUS L3 R3 HOME
+    CAPTURE DUP DDOWN DLEFT DRIGHT`; optional `+`/`-` = hold/release; bare = tap
+    (press + 90 ms auto-release). `A`→B2,`B`→B1,`X`→B3,`Y`→B4 (Switch ABXY),
+    `ZL`→L2, etc. Analog sticks via `LX=`/`LY=`/`RX=`/`RY=` (0..255, 128=center,
+    held until changed); `CENTER` recenters. (Buttons + sticks; both transports.)
+  - Temp debug instrumentation (`msgout_dbg_*`, `msgout_svc_*`,
+    `msgout_held_buttons`, J-Link-readable) — **strip before merge**.
+- `gesture_profile_lib/examples/switch-radial.mkprofile` (tauri-app) — radial
+  profile mapping gestures → button tokens via `.aaMouthpadMessageOutput`.
+
+## Wired-UART message-output (parallel input path)
+
+A second transport for the **same tokens**, alongside the BLE `6E40FE01` char —
+for bench/CI without BLE: a USB-to-UART adapter writes tokens straight to the board.
+
+- **Seam:** both paths converge on `msgout_handle_token()` (now non-static; declared
+  in `src/bt/ble_output/msgout.h`). The UART path adds no button logic — identical
+  grammar and hold/release/tap semantics.
+- **`src/bt/ble_output/msgout_uart.c`** — Zephyr interrupt-driven UART RX; frames
+  whitespace-delimited tokens (`"A+ ZL+\n"`, `"A\nB\n"`, …) and calls
+  `msgout_handle_token()` per token. Compiles to a no-op unless the board's
+  devicetree selects a `joypad,msgout-uart` chosen node.
+- **`ble_output_late_init()`** calls `msgout_uart_init()` after registering the BLE
+  service handler — both paths live at once.
+- **DK wiring** (`nrf52840dk_nrf52840.overlay`): `uart1` @115200 8N1, TX=P1.01,
+  RX=P1.02. Adapter TX → board RX (P1.02), GND common. Drive it with e.g.
+  `printf 'A+ ZL+\n' > /dev/ttyUSB0` (or any serial terminal).
+- **Build:** `msgout_uart.c` added to the controller_btusb source list;
+  `CONFIG_UART_INTERRUPT_DRIVEN=y` in `prj_controller_btusb.conf`.
+- Not reusing `src/native/host/uart/uart_host.c` (Pico-SDK-only); this is a Zephyr
+  binding. `uart_protocol.h`'s binary packet framing is for the generic
+  `input_event` UART path, not these ASCII tokens.
+
+## VERIFIED on hardware (via the Pi, clean BlueZ)
+Pi `pi@10.0.0.97`: board advertises 6E40FE00, connects, GATT shows 6e40fe00 +
+6e40fe01. A **raw ATT Write Command** (`tools/att_write_raw.py`, L2CAP CID 4) of
+`A+` then `ZL+` → service handler got `handle=0x4b, mode=NONE, size=3, data` →
+`msgout_held_buttons = 0x42` (B2|L2 = A|ZL). ✓
+
+## Test tools (`nrf/tools/`)
+- `att_write_raw.py <addr> <handle_hex> <token>` — raw ATT Write Command over
+  L2CAP. THE reliable Linux test (e.g. `... DE:B7:53:18:22:29 0x004b "A+"`).
+- `cw.py` / `msgout_ble_test.py` — bleak. NOTE: bleak's `write_gatt_char` on
+  **Linux/BlueZ** does NOT put a normal ATT Write on the wire (btmon = 0 Write
+  PDUs); use `att_write_raw.py`. On **Windows/WinRT** bleak's write should be a
+  real Write Command.
+- `scan_all.py`, `toggle_bt.py` (Windows radio reset), `README_msgout_switch.md`.
+
+## J-Link debug recipe (printk-to-RTT is silent — read RAM directly)
+```
+JLINK="/c/Program Files/SEGGER/JLink_V818/JLink.exe"  -SelectEmuBySN 1050287076
+# read global:  halt / mem32 0xADDR, N / go / exit   (do NOT 'r' — clears RAM)
+# breakpoint:   r / setbp 0xADDR / g / sleep 20000 / halt / regs / exit
+# arm-zephyr-eabi-addr2line -f -e build_dk_ctrl/zephyr/zephyr.elf 0xADDR
+# re-nm after every build — global addresses move.
+```
+
+## Gotchas / dead-ends (don't repeat)
+- **bleak-on-Linux write doesn't deliver** (AcquireWrite path). Use att_write_raw.py / btleplug.
+- **Windows stale GATT cache** for DE:B7:53:18:22:29 (shows old MouthPad GATT, no
+  6e40fe00). Clear via elevated `pnputil /remove-device` or reboot.
+- **WinRT BLE stack wedges** after failed bleak sessions (scanner won't start).
+  `toggle_bt.py` helps; reboot is the reliable reset.
+- **A registered service handler is REQUIRED** for a custom DYNAMIC write char;
+  the generic att_write_callback never gets its data. (The core lesson.)
+- controller_btusb is RP2040-oriented; its Pico/sensor init is `#ifdef`-guarded
+  out on the DK and it idles fine once `REQUIRE_BT_INPUT=0`.
+
+## Remaining work
+1. Strip debug instrumentation; tidy diff.
+2. Confirm companion (btleplug) connect+write end-to-end (Windows after reboot, or
+   macOS) — companion sends a normal Write Command → service handler receives it.
+3. Verify USB HID report on the wire; default USB output mode to Switch.
+4. Validate switch-radial.mkprofile; full HIL: MouthPad gesture → companion → Switch.
