@@ -613,7 +613,7 @@ void usbd_init(void)
     // GameCube config mode: always force CDC-only (ignore flash-saved mode)
     output_mode = USB_OUTPUT_MODE_CDC;
 #endif
-#ifdef MSGOUT_DK_BUILD
+#ifdef MSGOUT_SWITCH_BUILD
     // DK message-output -> Switch bring-up: always enumerate as a Switch Pro
     // controller (ignore flash) so a Nintendo Switch recognizes the board.
     output_mode = USB_OUTPUT_MODE_SWITCH;
@@ -1074,7 +1074,7 @@ static bool usbd_send_switch_report(uint8_t player_index)
         return false;
     }
 
-#ifdef MSGOUT_DK_BUILD
+#ifdef MSGOUT_SWITCH_BUILD
     // DK message-output -> Switch: a Switch only registers a controller that
     // streams reports continuously, not just on input. Hold the last state
     // (centered-stick neutral until the first message-output write) and send it

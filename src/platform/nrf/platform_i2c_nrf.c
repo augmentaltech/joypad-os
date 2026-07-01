@@ -22,9 +22,12 @@ platform_i2c_t platform_i2c_init(const platform_i2c_config_t* config)
     struct platform_i2c* bus = &i2c_buses[config->bus];
     if (bus->initialized) return bus;
 
-    // Get Zephyr I2C device (pins configured via devicetree)
+    // Get Zephyr I2C device (pins configured via devicetree). Use the _OR_NULL
+    // form for both buses so the build succeeds on boards that leave a bus
+    // disabled (e.g. the XIAO's i2c0) — an absent bus just fails device_is_ready
+    // below and the caller (JoyWing seesaw) no-ops.
     if (config->bus == 0) {
-        bus->dev = DEVICE_DT_GET(DT_NODELABEL(i2c0));
+        bus->dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(i2c0));
     } else {
         bus->dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(i2c1));
     }

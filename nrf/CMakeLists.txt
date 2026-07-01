@@ -737,28 +737,30 @@ elseif(BOARD MATCHES "nrf52840dongle")
 elseif(BOARD MATCHES "nrf52840dk")
     # Nordic nRF52840 DK (PCA10056) — bring-up board for the MouthPad -> Switch
     # path. No BOARD_DEFINE: it uses the default (XIAO-style) i2c1 display path,
-    # which boards/nrf52840dk_nrf52840.overlay enables. Unlike the shipping
-    # boards, this build doesn't get the nRF MDK on the app include path, so
-    # TinyUSB's dcd_nrf5x.c can't find nrf.h — add the MDK headers here.
+    # which boards/nrf52840dk_nrf52840.overlay enables.
     set(BOARD_NAME_STR "nrf52840dk")
-    target_include_directories(app PRIVATE "${ZEPHYR_BASE}/../modules/hal/nordic/nrfx/bsp/stable/mdk")
-    # Compatibility shim: TinyUSB's dcd_nrf5x.c (built for an older nrfx) calls
-    # nrf_clock_hf_is_running(), which NCS v3.3.0's nrfx removed.
-    target_sources(app PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/nrfx_compat_shim.c")
-    # DK bring-up marker — gates the DK-only message-output -> Switch tweaks
-    # (force USB Switch output mode in usbd_init; trimmed adv data in ble_output).
-    target_compile_definitions(app PRIVATE MSGOUT_DK_BUILD=1)
-    if(APP_TYPE STREQUAL "controller_btusb")
-        # The MouthPad message-output -> Switch path is peripheral-only: the board
-        # advertises 6E40FE00 and outputs USB. controller_btusb otherwise sets
-        # REQUIRE_BT_INPUT=1, which makes the BTstack post-init the BLE *central*
-        # setup (bt_central_post_init) instead of ble_output_late_init — so the
-        # peripheral never advertises. Force it off here (last -D wins) so the
-        # post-init is ble_output_late_init and the board advertises.
-        target_compile_definitions(app PRIVATE REQUIRE_BT_INPUT=0)
-    endif()
 else()
     set(BOARD_NAME_STR "xiao_ble")
+endif()
+
+# The DK and XIAO both build against the default (no BOARD_DEFINE) path, which
+# doesn't put the nRF MDK on the app include path — so TinyUSB's dcd_nrf5x.c
+# can't find nrf.h. Add the MDK headers. dcd_nrf5x.c also calls
+# nrf_clock_hf_is_running(), which NCS v3.3.0's nrfx removed, so pull in the
+# compat shim.
+if(BOARD MATCHES "nrf52840dk" OR BOARD MATCHES "xiao_ble")
+    target_include_directories(app PRIVATE "${ZEPHYR_BASE}/../modules/hal/nordic/nrfx/bsp/stable/mdk")
+    target_sources(app PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/nrfx_compat_shim.c")
+endif()
+
+# MouthPad message-output -> Switch build: the DK bring-up board and the shipping
+# XIAO, built as controller_btusb, drive a Switch as a peripheral-only message-
+# output target (BLE 6E40FE00 advertising + wired-UART tokens, never a BLE
+# central). MSGOUT_SWITCH_BUILD gates the tweaks: forced Switch USB output mode
+# (usbd), trimmed advertising (ble_output), and the BLE central scanner pinned
+# off (app.h forces REQUIRE_BT_INPUT=0, which app.c is guaranteed to see).
+if(APP_TYPE STREQUAL "controller_btusb" AND (BOARD MATCHES "nrf52840dk" OR BOARD MATCHES "xiao_ble"))
+    target_compile_definitions(app PRIVATE MSGOUT_SWITCH_BUILD=1)
 endif()
 
 target_compile_definitions(app PRIVATE

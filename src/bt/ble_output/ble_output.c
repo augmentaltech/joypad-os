@@ -325,7 +325,7 @@ static const uint8_t scan_resp_standard[] = {
     0x93, 0xF3, 0xA3, 0xB5, 0x00, 0xFE, 0x40, 0x6E,
 };
 
-#ifdef MSGOUT_DK_BUILD
+#ifdef MSGOUT_SWITCH_BUILD
 // Minimal adv data for the nRF52840 DK: flags + complete local name only (24
 // bytes). adv_data_standard is 32 bytes — over the 31-byte legacy advertising
 // limit — which the strict nRF SoftDevice Controller rejects, so the board
@@ -849,7 +849,7 @@ void ble_output_late_init(void)
         adv_data_len = sizeof(adv_data_xbox);
     } else {
         gap_name = "JoypadOS Controller";
-#ifdef MSGOUT_DK_BUILD
+#ifdef MSGOUT_SWITCH_BUILD
         adv_data = adv_data_dk;
         adv_data_len = sizeof(adv_data_dk);
 #else
