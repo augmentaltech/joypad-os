@@ -790,6 +790,7 @@ void app_task(void)
     // Process BLE transport
     bt_task();
 
+#if !defined(MSGOUT_SWITCH_BUILD)
     // NeoPixel: show connection state and active output mode color
     bool ble_conn = ble_output_is_connected();
     bool usb_active = usb_gamepad_active();
@@ -831,6 +832,7 @@ void app_task(void)
             }
         }
     }
+#endif  // !MSGOUT_SWITCH_BUILD (msgout build owns the LEDs via status_led_*)
 #else
     // USB-only: show USB mode color
     bool usb_active = usb_gamepad_active();

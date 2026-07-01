@@ -312,6 +312,50 @@ void neopixel_init(void)
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Message-output -> Switch status LED: blue = advertising, green = a central
+// connected, red flash = UART token received. Drives the discrete RGB directly
+// (the app's LED mode-color update is gated off for MSGOUT_SWITCH_BUILD, so this
+// is the only owner). Always defined so msgout_uart.c/ble_output.c link; active
+// only on the msgout non-Feather build.
+// ---------------------------------------------------------------------------
+#if defined(MSGOUT_SWITCH_BUILD) && !defined(BOARD_FEATHER_NRF52840)
+static bool status_connected;
+
+static void status_restore(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    set_rgb(false, status_connected, !status_connected);  // green if connected, else blue
+}
+static K_WORK_DELAYABLE_DEFINE(status_restore_work, status_restore);
+#endif
+
+void status_led_start(void)
+{
+#if defined(MSGOUT_SWITCH_BUILD) && !defined(BOARD_FEATHER_NRF52840)
+    status_connected = false;
+    set_rgb(false, false, true);  // blue = advertising
+#endif
+}
+
+void status_led_set_connected(bool connected)
+{
+#if defined(MSGOUT_SWITCH_BUILD) && !defined(BOARD_FEATHER_NRF52840)
+    status_connected = connected;
+    set_rgb(false, connected, !connected);  // green connected / blue advertising
+#else
+    (void)connected;
+#endif
+}
+
+void status_led_note_uart(void)
+{
+#if defined(MSGOUT_SWITCH_BUILD) && !defined(BOARD_FEATHER_NRF52840)
+    set_rgb(true, false, false);  // red flash
+    k_work_reschedule(&status_restore_work, K_MSEC(60));
+#endif
+}
+
 void neopixel_set_override_color(uint8_t r, uint8_t g, uint8_t b)
 {
     override_r = r;

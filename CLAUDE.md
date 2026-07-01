@@ -529,6 +529,47 @@ error -102, power-cycle the DK and retry). XIAO = **no debugger**: double-tap
 reset → `XIAO-SENSE` USB drive → drag `build_xiao_ctrl/nrf/zephyr/zephyr.uf2`.
 `build*/` is gitignored — stage source explicitly, never `git add -A`.
 
+**SWD-flashing the XIAO (J-Link on the expansion board).** The XIAO has no
+onboard debugger; wire an external J-Link to the expansion board's SWD header
+(that probe = SN **51019419**; DK = 1050287076, MouthPad = 1050222688 — never
+flash that one). GOTCHA: the shipping XIAO build links the app at **0x27000** for
+the Adafruit UF2 bootloader (`CONFIG_FLASH_LOAD_OFFSET=0x27000` via the DT
+code-partition), and `nrfjprog --chiperase` ERASES that bootloader — so a 0x27000
+app then has blank vectors at 0x0 and HardFaults on reset (over J-Link:
+`PC=0xFFFFFFFE`, `SP=0xFFFFFFFF`, `IPSR=3 HardFault` — read with `JLink.exe …
+-CommanderScript` running `halt`/`regs`). For SWD, link the app at flash origin
+0x0 with **`xiao_swd.conf`** (`CONFIG_USE_DT_CODE_PARTITION=n`,
+`CONFIG_FLASH_LOAD_OFFSET=0`, `CONFIG_BUILD_OUTPUT_UF2=n`) **and `--no-sysbuild`**
+(sysbuild's NCS Partition Manager overrides `FLASH_LOAD_OFFSET` and keeps 0x27000):
+```bash
+cd /c/ncs
+nrfutil toolchain-manager launch --ncs-version v3.3.0 -- \
+  west build -b xiao_ble -d <nrf>/build_xiao_swd <nrf> --pristine=always --no-sysbuild -- \
+    -DAPP_TYPE=controller_btusb \
+    -DDTC_OVERLAY_FILE=<nrf>/boards/xiao_ble.overlay \
+    -DEXTRA_CONF_FILE="<nrf>/boards/xiao_ble.conf;<nrf>/prj_controller_btusb.conf;<nrf>/xiao_swd.conf"
+nrfjprog --program <nrf>/build_xiao_swd/zephyr/zephyr.hex --chiperase --verify --reset --snr 51019419
+```
+Confirm it's running (not HardFaulting) with `halt`/`regs`: PC in app flash,
+valid `SP=0x2001xxxx`, `IPSR=000 (NoException)`. (This wipes the UF2 bootloader;
+re-flash the Adafruit XIAO bootloader to get drag-drop UF2 back. Drop
+`xiao_swd.conf` + `--no-sysbuild` to build the shipping UF2 image again.)
+
+**Status LED (XIAO discrete RGB, `MSGOUT_SWITCH_BUILD`).** blue = advertising,
+green = a BLE central connected, red flash = a UART token arrived. Driven
+event-first from ble_output.c (advertise/connect/disconnect) + msgout_uart.c (per
+token) via `status_led_*` in ws2812_nrf.c; the app's mode-color LED update is
+gated off for the msgout build so it's the sole LED owner. Steady blue = idle
+advertising (expected).
+
+**Verify UART → HID end-to-end** (XIAO USB into the same host): in Switch mode
+the board enumerates as HORI POKKEN CONTROLLER **0f0d:0092**. Read its HID input
+reports with `pywinusb` while writing tokens to the FTDI UART adapter (e.g. COM27
+/ serial `BH004YUX`): report layout `[id btn0 btn1 hat LX LY RX RY vendor]`,
+sticks default 0x80; `A+` sets btn0 bit2 (0x04), `B+` → 0x02. NOTE stick tokens
+are re-scaled by the touch→stick conversion (LX expects a raw 0..1024 touch
+coordinate, mirrored), so `LX=255` reads back ~0xaa, not 0xff — expected.
+
 ## Files changed
 - `nrf/boards/nrf52840dk_nrf52840.{overlay,conf}` — DK port: enable `i2c1`
   (display init resolves), disable `usbd` (TinyUSB owns USB).

@@ -1,6 +1,7 @@
 #ifndef MSGOUT_H__
 #define MSGOUT_H__
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // MouthPad message-output: parse one ASCII button token and drive the router.
@@ -21,5 +22,14 @@ void msgout_handle_token(const uint8_t *data, uint16_t len);
 // via the devicetree chosen node `joypad,msgout-uart`. Call once the router /
 // output side is ready (e.g. from ble_output_late_init()).
 void msgout_uart_init(void);
+
+// Message-output -> Switch status LED (nRF DK/XIAO discrete RGB): blue =
+// advertising, green = a central connected, red flash = UART token received.
+// All no-op unless MSGOUT_SWITCH_BUILD (and a non-Feather board). Implemented in
+// ws2812_nrf.c; drive from the BLE connect/disconnect + advertise paths and the
+// UART RX handler.
+void status_led_start(void);
+void status_led_set_connected(bool connected);
+void status_led_note_uart(void);
 
 #endif // MSGOUT_H__

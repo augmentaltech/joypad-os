@@ -414,6 +414,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             con_handle = HCI_CON_HANDLE_INVALID;
             ble_connected = false;
             pending_type = PENDING_NONE;
+#ifdef MSGOUT_SWITCH_BUILD
+            status_led_set_connected(false);  // blue = advertising
+#endif
             printf("[ble_output] Disconnected, restarting advertising\n");
             gap_advertisements_enable(1);
             break;
@@ -431,6 +434,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 case HIDS_SUBEVENT_INPUT_REPORT_ENABLE:
                     con_handle = hids_subevent_input_report_enable_get_con_handle(packet);
                     ble_connected = true;
+#ifdef MSGOUT_SWITCH_BUILD
+                    status_led_set_connected(true);  // green = connected
+#endif
                     printf("[ble_output] BLE connected (handle=0x%04x)\n", con_handle);
                     // Keep advertising while connected so web config can
                     // discover the device via Web Bluetooth for NUS access
@@ -872,6 +878,9 @@ void ble_output_late_init(void)
     }
     gap_advertisements_enable(1);
     printk("[BLE] advertising ENABLED (mode=%d name=%s)\n", current_mode, gap_name);
+#ifdef MSGOUT_SWITCH_BUILD
+    status_led_start();  // blue = advertising
+#endif
 
     // Register event handlers
     hci_event_callback_registration.callback = &packet_handler;

@@ -42,6 +42,7 @@ static void msgout_work_handler(struct k_work *work)
 		if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
 			if (tok_len > 0) {
 				msgout_handle_token(tok, (uint16_t)tok_len);
+				status_led_note_uart();
 				tok_len = 0;
 			}
 		} else if (tok_len < sizeof(tok)) {
