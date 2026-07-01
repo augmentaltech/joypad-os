@@ -476,6 +476,59 @@ nrfutil toolchain-manager launch --ncs-version v3.3.0 -- \
   west flash -d /c/Users/suraj/code/joypad-os/nrf/build_dk_ctrl --dev-id 1050287076
 ```
 
+## Building for the XIAO (shipping board) + env gotchas
+
+The DK was the bring-up rig; **`xiao_ble` is the shipping board** and now builds
+the same message-output → Switch firmware. Learnings from getting it green:
+
+**Build environment (Windows).** There is NO west workspace in `joypad-os/nrf`
+— the NCS workspace is `C:\ncs`, so build from there through the toolchain
+launcher. Two failure modes if you don't: `west: unknown command "build"` (not
+in a workspace) and a Python `_type_` AttributeError during CMake reconfigure.
+**Never `ninja -C <builddir>` to reconfigure** — bare ninja/cmake picks up the
+wrong Python. The command that works:
+
+```bash
+cd /c/ncs
+nrfutil toolchain-manager launch --ncs-version v3.3.0 -- \
+  west build -b xiao_ble -d /c/Users/suraj/code/joypad-os/nrf/build_xiao_ctrl \
+    /c/Users/suraj/code/joypad-os/nrf --pristine=always -- \
+    -DAPP_TYPE=controller_btusb \
+    -DDTC_OVERLAY_FILE=/c/Users/suraj/code/joypad-os/nrf/boards/xiao_ble.overlay \
+    -DEXTRA_CONF_FILE="/c/Users/suraj/code/joypad-os/nrf/boards/xiao_ble.conf;/c/Users/suraj/code/joypad-os/nrf/prj_controller_btusb.conf"
+```
+Incremental (source-only edit): `west build -d <builddir>`. A conf/Kconfig or
+CMakeLists change reconfigures automatically — still via `west build`, not ninja.
+
+**One marker, both boards.** `MSGOUT_SWITCH_BUILD` (renamed from the DK-only
+`MSGOUT_DK_BUILD`) is set in CMakeLists for `controller_btusb` on both
+`nrf52840dk` and `xiao_ble`. It gates forced Switch USB mode + trimmed adv, and
+via `app.h` (`#if defined(MSGOUT_SWITCH_BUILD)` → `REQUIRE_BT_INPUT=0`) the
+BLE-central-off. **app.h is authoritative** — the CMake `-DREQUIRE_BT_INPUT=0`
+override loses the "last -D wins" race to controller_btusb's `=1`, so pinning it
+in the header is the reliable way.
+
+**XIAO porting fixes** (controller_btusb had never built for it):
+- **MDK include + nrfx compat shim** — TinyUSB `dcd_nrf5x.c` needs `nrf.h` and
+  `nrf_clock_hf_is_running()` (dropped in v3.3.0 nrfx). NOT DK-specific: a shared
+  `if(BOARD MATCHES nrf52840dk OR xiao_ble)` block in CMakeLists adds both.
+- **`platform_i2c_nrf.c`** — use `DEVICE_DT_GET_OR_NULL` for i2c0 (not
+  `DEVICE_DT_GET`, which is a *compile* error where the bus is disabled, as on the
+  XIAO). The JoyWing seesaw just no-ops (unused on this path).
+- **`xiao_ble.conf: CONFIG_BOARD_SERIAL_BACKEND_CDC_ACM=n`** — the XIAO defaults
+  to a USB-CDC console, which pulls in the device-next USB stack +
+  `cdc_acm_serial.c` and binds the UDC the overlay disables for TinyUSB.
+  (`CONFIG_USBD` / `CONFIG_USB_DEVICE_STACK` are the WRONG symbols — `USBD` is
+  undefined here and aborts on the Kconfig warning.) Console → uart0 / RTT.
+- **`xiao_ble.overlay`** — `uart1` msgout on **D6 = P1.11 (TX) / D7 = P1.12 (RX)**,
+  115200, plus the `joypad,msgout-uart` chosen node. Adapter TX → D7, RX → D6, GND.
+
+**Flashing.** DK = J-Link (`nrfjprog --program <builddir>/zephyr/zephyr.hex
+--sectorerase --verify --reset --snr 1050287076`; on "Cannot connect to J-Link"
+error -102, power-cycle the DK and retry). XIAO = **no debugger**: double-tap
+reset → `XIAO-SENSE` USB drive → drag `build_xiao_ctrl/nrf/zephyr/zephyr.uf2`.
+`build*/` is gitignored — stage source explicitly, never `git add -A`.
+
 ## Files changed
 - `nrf/boards/nrf52840dk_nrf52840.{overlay,conf}` — DK port: enable `i2c1`
   (display init resolves), disable `usbd` (TinyUSB owns USB).
