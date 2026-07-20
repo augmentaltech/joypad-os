@@ -713,7 +713,15 @@ static int msgout_service_write_callback(hci_con_handle_t con_handle, uint16_t a
         return 0;
     }
     if (attribute_handle == ATT_CHARACTERISTIC_6E40FE01_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE) {
-        msgout_handle_token(buffer, buffer_size);
+        // Route the whole ATT write through the SAME whitespace tokenizer as the
+        // wired-UART path (msgout_feed_bytes -> msgout_work_handler) so multi-token
+        // frames like "B- X- CENTER" split into individual tokens instead of
+        // collapsing in the single-token parser. BLE writes carry no trailing
+        // delimiter, so append one to flush the final token — otherwise the stick
+        // recenter is dropped and the analog stick sticks on its last value.
+        static const uint8_t msgout_eom = '\n';
+        msgout_feed_bytes(buffer, buffer_size);
+        msgout_feed_bytes(&msgout_eom, 1);
     }
     return 0;
 }
@@ -751,7 +759,11 @@ static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle,
     printf("\n");
 
     if (att_handle == ATT_CHARACTERISTIC_6E40FE01_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE) {
-        msgout_handle_token(buffer, buffer_size);
+        // Same shared UART-style tokenizer as above (see msgout_service_write_callback):
+        // split the ATT write into whitespace-delimited tokens + flush with a newline.
+        static const uint8_t msgout_eom = '\n';
+        msgout_feed_bytes(buffer, buffer_size);
+        msgout_feed_bytes(&msgout_eom, 1);
     }
     return 0;  // Let hids_device handle it
 }

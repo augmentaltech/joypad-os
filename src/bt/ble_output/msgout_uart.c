@@ -1,4 +1,4 @@
-// Wired-UART message-output input — a parallel path to the BLE 6E40FE01 service.
+// Message-output receive tokenizer, shared by BOTH input transports.
 //
 // A USB-to-UART adapter wired to the board's msgout UART pins writes the SAME
 // ASCII tokens the BLE characteristic accepts, whitespace-delimited (one token
@@ -6,31 +6,33 @@
 // msgout_handle_token(), so both transports share the token grammar and the
 // button hold/release/tap + analog-stick semantics.
 //
-// Enabled per-board by a devicetree chosen node:
-//     chosen { joypad,msgout-uart = &uart1; };
-// Absent -> msgout_uart_init() is a no-op (the BLE path is unaffected).
+// Framing (splitting a byte stream into whitespace-delimited tokens) lives here
+// in msgout_feed_bytes()/msgout_work_handler() and is used by BOTH paths so BLE
+// and UART parse identically:
+//   - UART: the RX ISR buffers bytes as they arrive (below, gated on a board
+//     having `joypad,msgout-uart` chosen).
+//   - BLE:  ble_output.c hands each ATT write to msgout_feed_bytes().
+// msgout_handle_token() itself is a SINGLE-token parser — it must be fed one
+// token at a time, which is exactly what this splitter guarantees. (Handing it a
+// whole multi-token frame collapses it into one garbage token; that was the
+// "analog stick sticks on BLE" bug, because the recenter frame "B- X- CENTER"
+// never reached the driver.)
 //
-// The UART RX ISR only buffers bytes into a ring buffer; framing + dispatch run
-// in a workqueue item, because msgout_handle_token() submits to the router and
-// logs — neither is safe from ISR context.
+// The tokenizer runs in a workqueue item, not the ISR/ATT-callback context,
+// because msgout_handle_token() submits to the router and logs — neither is
+// safe from ISR context.
 
 #include "msgout.h"
 
 #include <zephyr/kernel.h>
-
-#if DT_HAS_CHOSEN(joypad_msgout_uart)
-
-#include <zephyr/device.h>
-#include <zephyr/drivers/uart.h>
 #include <zephyr/sys/ring_buffer.h>
-
-static const struct device *const msgout_uart_dev =
-	DEVICE_DT_GET(DT_CHOSEN(joypad_msgout_uart));
 
 RING_BUF_DECLARE(msgout_rx_rb, 256);
 
 // Runs in the system workqueue (serialized), so the framing state is safe and
-// msgout_handle_token() executes in thread context.
+// msgout_handle_token() executes in thread context. `tok`/`tok_len` are static
+// so a token may span multiple feeds (a UART burst can split a token, and BLE
+// frames are terminated with whitespace so their final token flushes).
 static void msgout_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -54,14 +56,39 @@ static void msgout_work_handler(struct k_work *work)
 }
 static K_WORK_DEFINE(msgout_work, msgout_work_handler);
 
+void msgout_feed_bytes(const uint8_t *data, uint16_t len)
+{
+	if (len > 0) {
+		ring_buf_put(&msgout_rx_rb, data, len);  // overflow drops the tail
+	}
+	k_work_submit(&msgout_work);
+}
+
+// ---------------------------------------------------------------------------
+// Wired-UART receive path — feeds the shared tokenizer above. Enabled per-board
+// by a devicetree chosen node:
+//     chosen { joypad,msgout-uart = &uart1; };
+// Absent -> msgout_uart_init() is a no-op (the BLE path is unaffected).
+// ---------------------------------------------------------------------------
+
+#if DT_HAS_CHOSEN(joypad_msgout_uart)
+
+#include <zephyr/device.h>
+#include <zephyr/drivers/uart.h>
+
+static const struct device *const msgout_uart_dev =
+	DEVICE_DT_GET(DT_CHOSEN(joypad_msgout_uart));
+
+// The UART RX ISR only buffers bytes into the shared ring buffer; framing +
+// dispatch run in the workqueue (msgout_work), same as the BLE path.
 static void msgout_uart_isr(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(user_data);
 	if (!uart_irq_update(dev)) {
 		return;
 	}
-	bool got = false;
 	uint8_t c;
+	bool got = false;
 	while (uart_irq_rx_ready(dev) && uart_fifo_read(dev, &c, 1) == 1) {
 		ring_buf_put(&msgout_rx_rb, &c, 1);  // overflow drops the byte
 		got = true;

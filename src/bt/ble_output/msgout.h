@@ -16,7 +16,23 @@
 // Two parallel input paths feed this single handler:
 //   - BLE: the message-output characteristic 6E40FE01 (see ble_output.c)
 //   - UART: a USB-to-UART adapter on the msgout UART pins (see msgout_uart.c)
+//
+// NOTE: this parses exactly ONE token. Do not hand it a whole multi-token frame
+// (it strips whitespace rather than splitting on it, collapsing e.g.
+// "B- X- CENTER" into one garbage token). Feed raw received bytes through
+// msgout_feed_bytes() instead, which splits on whitespace and calls this per
+// token — both transports use it so BLE and UART parse identically.
 void msgout_handle_token(const uint8_t *data, uint16_t len);
+
+// Feed received message-output bytes into the shared whitespace tokenizer
+// (buffered, split on whitespace, and dispatched to msgout_handle_token() from
+// the system workqueue). Used by both transports:
+//   - UART: msgout_uart.c streams bytes in as the RX ISR receives them.
+//   - BLE:  ble_output.c hands each ATT write to it, terminated with a newline
+//           so the frame's final token flushes.
+// A complete frame must end in whitespace/newline for its last token to flush
+// (a bare trailing token stays buffered until the next delimiter arrives).
+void msgout_feed_bytes(const uint8_t *data, uint16_t len);
 
 // Bring up the wired-UART message-output path. No-op unless a UART is selected
 // via the devicetree chosen node `joypad,msgout-uart`. Call once the router /
