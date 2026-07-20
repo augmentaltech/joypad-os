@@ -392,6 +392,36 @@ make flash-bt2usb_seeed_xiao_nrf52840   # Flash via UF2 bootloader
 make monitor-bt2usb_seeed_xiao_nrf52840 # UART serial monitor
 ```
 
+### Building on Windows (nrfutil + `C:\ncs` workspace)
+
+The `make bt2usb_*` targets above are Unix-only for nRF: `nrf/Makefile` auto-detects the
+NCS toolchain from `/opt/nordic/ncs/toolchains/*/bin`, which doesn't exist on Windows. On
+Windows, build directly with `nrfutil` against the Toolchain-Manager workspace at `C:\ncs`.
+`west`'s `build` subcommand only exists **inside** a workspace, so run from `C:\ncs` and
+point `-d` at the app's build dir (the app source is an out-of-tree Zephyr app under
+`<repo>/nrf`, built with sysbuild):
+
+```bash
+nrfutil toolchain-manager list   # confirm the installed NCS version (e.g. v3.3.0)
+
+# Incremental rebuild of an existing build dir (recompiles only changed files) — the
+# fast way to sanity-check a code change actually compiles/links for xiao_ble:
+cd /c/ncs && nrfutil toolchain-manager launch --ncs-version v3.3.0 -- \
+    west build -d <repo>/nrf/build_xiao_ctrl
+
+# Fresh xiao_ble sysbuild build (flags mirror an existing build dir's CMakeCache;
+# swap the prj_*.conf for the app variant you want):
+cd /c/ncs && nrfutil toolchain-manager launch --ncs-version v3.3.0 -- \
+    west build -b xiao_ble --sysbuild -d <repo>/nrf/build_xiao_ctrl <repo>/nrf -- \
+    -DEXTRA_CONF_FILE="boards/xiao_ble.conf;prj_controller_btusb.conf" \
+    -DDTC_OVERLAY_FILE="boards/xiao_ble.overlay"
+```
+
+Output UF2: `nrf/<build_dir>/nrf/zephyr/zephyr.uf2`. Match `--ncs-version` to whatever
+`nrfutil toolchain-manager list` reports. (The BLE + wired-UART message-output code in
+`src/bt/ble_output/` is compiled into these builds, so this is how to compile-verify a
+change there without hardware.)
+
 Key differences from RP2040:
 - **BLE only** - nRF52840 supports Classic BT but this port is BLE-only like ESP32; only BLE controllers work
 - **Zephyr RTOS** - BTstack runs in its own Zephyr thread (`k_thread_create`); main loop yields via `k_msleep(1)`
